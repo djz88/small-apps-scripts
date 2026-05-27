@@ -1,0 +1,41 @@
+# Secrets
+token
+.env
+.env.*
+!.env.example
+
+# Generated reports and converted audio artifacts
+reports/
+source.wav
+*.raw
+
+# Local sample/source recordings
+*.aac
+*.aiff
+*.amr
+*.flac
+*.m4a
+*.mov
+*.mp3
+*.mp4
+*.ogg
+*.opus
+*.wav
+*.webm
+
+# Python runtime artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local agent/tool metadata
+.agents/
+.codex/
