@@ -21,11 +21,14 @@ signals, and optional Modulate.ai model outputs.
 - `ffmpeg` for decoding and normalized WAV conversion
 - Modulate Developer APIs from `modulate-developer-apis.com`
 - Modulate documentation: <https://docs.modulate.ai/>
+- Reality Defender Python SDK and API from `realitydefender.ai`
+- Reality Defender documentation: <https://docs.realitydefender.com/>
 - Local JSON and Markdown report generation
 
-The Modulate-backed checks require an API key. The key is read from
+The Modulate-backed checks require a Modulate API key. The key is read from
 `MODULATE_API_KEY` or from a local file passed with `--api-key-file`; by default
-the script looks for `token`.
+the script looks for `token`. Reality Defender checks require a Reality Defender
+API key from `REALITY_DEFENDER_API_KEY` or the same `token` file.
 
 ## Main Checks
 
@@ -36,6 +39,15 @@ the script looks for `token`.
 - Modulate synthetic voice detection batch output
 - Modulate STT enrichment output: transcript, speaker, language, emotion,
   accent, and STT deepfake signal
+- Reality Defender ensemble audio deepfake/manipulation detection output
+
+External API scans prefer the original input file. Provider-specific fallbacks
+are used only for formats known to be rejected or when a provider rejects the
+original upload. Modulate STT currently falls back to `source.wav` for AMR.
+Reality Defender is submitted with the original file first, including AMR; if
+that upload is rejected as an unsupported/invalid format and a converted WAV is
+available, the script retries Reality Defender with `source.wav` and records the
+fallback reason in the report.
 
 ## Setup
 
@@ -60,7 +72,14 @@ export MODULATE_API_KEY="your-api-key"
 or put the key into a local file named `token`. The script uses `token`
 automatically by default when `MODULATE_API_KEY` is not set. A template is
 provided as `token.example`; copy it to `token` and replace the placeholder with
-your Modulate Developer API key. Do not commit the real `token` file.
+your API keys:
+
+```text
+modulate:your-modulate-api-key
+realitydefender:your-reality-defender-api-key
+```
+
+Do not commit the real `token` file.
 
 ## Usage
 
@@ -73,7 +92,7 @@ python3 audio_authenticity_report.py
 Analyze one file with local checks only:
 
 ```bash
-python3 audio_authenticity_report.py test-voice.mp3 --out reports/test-voice
+python3 audio_authenticity_report.py test-voice.mp3 --out reports/local
 ```
 
 Analyze multiple files:
@@ -97,18 +116,51 @@ python3 audio_authenticity_report.py --all-local-audio --modulate --out reports/
 Run full checks for a single file:
 
 ```bash
-python3 audio_authenticity_report.py test-voice.mp3 --modulate --out reports/test-voice-full
+python3 audio_authenticity_report.py test-voice.mp3 --modulate --out reports/full-modulate
 ```
+
+Run local checks plus Reality Defender:
+
+```bash
+python3 audio_authenticity_report.py test-voice.mp3 --reality-defender --out reports/reality-defender
+```
+
+Wait longer for pending Reality Defender audio models:
+
+```bash
+python3 audio_authenticity_report.py test-voice.mp3 --reality-defender --reality-defender-wait-seconds 300 --out reports/reality-defender
+```
+
+Run Modulate and Reality Defender together:
+
+```bash
+python3 audio_authenticity_report.py test-voice.mp3 --all-checks --out reports/full
+```
+
+`--all-checks` runs all external checks: Modulate deepfake batch, Modulate STT
+enrichment, and Reality Defender.
 
 Print raw Modulate JSON to the terminal as well as saving it:
 
 ```bash
-python3 audio_authenticity_report.py test-voice.mp3 --modulate --show-raw-modulate --out reports/test-voice-full
+python3 audio_authenticity_report.py test-voice.mp3 --modulate --show-raw-modulate --out reports/full-modulate
+```
+
+Print raw Reality Defender JSON to the terminal as well as saving it:
+
+```bash
+python3 audio_authenticity_report.py test-voice.mp3 --reality-defender --show-raw-reality-defender --out reports/reality-defender
 ```
 
 ## Outputs
 
-Each analyzed file gets its own report directory containing:
+Each analyzed file gets its own directory under `reports/<input-stem>/`. Each
+requested report run is written under its own report stem, for example
+`--out reports/full-modulate` writes to
+`reports/test-voice/full-modulate/`. Without `--out`, the default is
+`reports/<input-stem>/report/`.
+
+Each report directory contains:
 
 - `report.md` - readable Markdown report
 - `report.json` - structured report data
@@ -116,10 +168,18 @@ Each analyzed file gets its own report directory containing:
 - `modulate_deepfake_batch.json` - raw Modulate synthetic voice detection output, when available
 - `modulate_stt_enrichment.json` - raw Modulate STT enrichment output, when available
 - `modulate_stt_enrichment_error.json` - raw Modulate STT error response, when the API rejects a request
+- `reality_defender_detection.json` - raw Reality Defender detection output, when available
+- `reality_defender_error.json` - raw Reality Defender error details, when analysis fails
 
 The terminal output shows progress, local findings, Modulate deepfake frame
-tables, and paths to generated artifacts. Raw Modulate JSON is not printed by
-default; use `--show-raw-modulate` when debugging API output.
+tables, Reality Defender findings, and paths to generated artifacts. Raw API
+JSON is not printed by default; use `--show-raw-modulate` or
+`--show-raw-reality-defender` when debugging API output.
+
+Reality Defender can return an overall result before every audio model has
+finished. The script polls for pending audio models for 120 seconds by default.
+Increase `--reality-defender-wait-seconds` if a model such as `rd-alethia-aud`
+still appears as `ANALYZING`.
 
 ## Interpretation
 

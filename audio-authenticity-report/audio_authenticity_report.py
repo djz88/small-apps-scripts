@@ -1,7 +1,9 @@
 import argparse
+import asyncio
 import hashlib
 import json
 import math
+import mimetypes
 import os
 import statistics
 import struct
@@ -17,6 +19,10 @@ DEFAULT_RMS_RATIO_THRESHOLD = 8.0
 DEFAULT_SAMPLE_RATE = 16000
 MAX_DECODE_SECONDS = 1800
 STT_BATCH_ENDPOINT = "https://modulate-developer-apis.com/api/velma-2-stt-batch"
+REALITY_DEFENDER_AUDIO_SIZE_LIMIT_BYTES = 20 * 1024 * 1024
+DEFAULT_REALITY_DEFENDER_WAIT_SECONDS = 120
+DEFAULT_REALITY_DEFENDER_POLL_INTERVAL_MS = 2000
+MODULATE_STT_CONVERTED_FALLBACK_SUFFIXES = {".amr"}
 AUDIO_SUFFIXES = {
     ".aac",
     ".aiff",
@@ -105,7 +111,7 @@ def classify_overall(findings: list[SignalFinding]) -> str:
 
     if len(strong) > 1 or (strong and warnings):
         return "multiple_strong_indications"
-    if any(finding.kind == "deepfake" for finding in strong):
+    if any(finding.kind == "deepfake" for finding in strong + warnings):
         return "possible_synthetic_voice_detected"
     if strong or warnings:
         return "possible_editing_detected"
@@ -516,15 +522,311 @@ def stt_enrichment_findings(
     return findings
 
 
+def _compact_evidence(value: dict[str, Any]) -> dict[str, Any]:
+    return {key: item for key, item in value.items() if item is not None}
+
+
+def _score_from_final_score(value: Any) -> float | None:
+    if value is None:
+        return None
+    score = float(value)
+    if score > 1:
+        return round(score / 100, 4)
+    return score
+
+
+def _score_text(value: Any) -> str:
+    if value is None:
+        return "?"
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return "?"
+    if score <= 1:
+        score *= 100
+    return f"{score:.2f}%"
+
+
+def reality_defender_model_score(model: dict[str, Any]) -> Any:
+    for key in ("score", "predictionNumber", "normalizedPredictionNumber", "finalScore"):
+        value = model.get(key)
+        if value is not None:
+            return value
+    data = model.get("data")
+    if isinstance(data, dict):
+        return data.get("score") or data.get("raw_score")
+    return None
+
+
+def normalize_reality_defender_result(result: dict[str, Any]) -> dict[str, Any]:
+    summary = result.get("resultsSummary") or result.get("results_summary") or {}
+    metadata = summary.get("metadata") or {}
+    status = result.get("status") or summary.get("status")
+    score = result.get("score")
+    if score is None:
+        score = _score_from_final_score(metadata.get("finalScore"))
+
+    return {
+        "request_id": result.get("request_id") or result.get("requestId"),
+        "media_id": result.get("media_id") or result.get("mediaId"),
+        "status": str(status).upper() if status is not None else None,
+        "score": score,
+        "models": result.get("models") or [],
+        "raw": result,
+    }
+
+
+def _reality_defender_models(result: dict[str, Any]) -> list[dict[str, Any]]:
+    models = result.get("models")
+    return models if isinstance(models, list) else []
+
+
+def reality_defender_model_vote_counts(result: dict[str, Any]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for model in _reality_defender_models(result):
+        status = str(model.get("status") or "UNKNOWN").lower()
+        counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
+def reality_defender_vote_summary(result: dict[str, Any]) -> str:
+    counts = reality_defender_model_vote_counts(result)
+    if not counts:
+        return "no model-level results"
+    order = ["manipulated", "fake", "suspicious", "authentic", "analyzing", "unknown"]
+    parts = []
+    for status in order:
+        count = counts.pop(status, 0)
+        if count:
+            parts.append(f"{count} {status}")
+    for status in sorted(counts):
+        parts.append(f"{counts[status]} {status}")
+    return ", ".join(parts)
+
+
+def reality_defender_content_type(path: Path) -> str:
+    if path.suffix.lower() == ".amr":
+        return "audio/amr"
+    content_type, _ = mimetypes.guess_type(str(path))
+    return content_type or "application/octet-stream"
+
+
+def pending_reality_defender_audio_models(result: dict[str, Any]) -> list[str]:
+    pending = []
+    for model in _reality_defender_models(result):
+        name = str(model.get("name") or "")
+        status = str(model.get("status") or "").upper()
+        if "-aud" in name and status in {"ANALYZING", "UNKNOWN"}:
+            pending.append(name)
+    return pending
+
+
+def poll_completion_metadata(
+    result: dict[str, Any],
+    attempts: int,
+) -> dict[str, Any]:
+    pending = pending_reality_defender_audio_models(result)
+    return {
+        "attempts": attempts,
+        "complete": not pending,
+        "pending_audio_models": pending,
+    }
+
+
+async def poll_reality_defender_media_detail(
+    client_impl: Any,
+    request_id: str,
+    max_attempts: int = 30,
+    polling_interval_ms: int = DEFAULT_REALITY_DEFENDER_POLL_INTERVAL_MS,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for attempt in range(max_attempts):
+        result = await client_impl.get(f"/api/media/users/{request_id}")
+        summary = result.get("resultsSummary") or result.get("results_summary") or {}
+        status = str(result.get("status") or summary.get("status") or "").upper()
+        pending = pending_reality_defender_audio_models(result)
+        if status and status not in {"ANALYZING", "UNKNOWN"} and not pending:
+            result["polling"] = poll_completion_metadata(result, attempt + 1)
+            return result
+        if attempt < max_attempts - 1:
+            await asyncio.sleep(polling_interval_ms / 1000)
+    result["polling"] = poll_completion_metadata(result, max_attempts)
+    return result
+
+
+def _reality_defender_reasons(result: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = result.get("raw") or {}
+    summary = raw.get("resultsSummary") or raw.get("results_summary") or {}
+    metadata = summary.get("metadata") or {}
+    reasons = metadata.get("reasons")
+    return reasons if isinstance(reasons, list) else []
+
+
+def reality_defender_findings(result: dict[str, Any]) -> list[SignalFinding]:
+    status = str(result.get("status") or "").upper()
+    score = result.get("score")
+    evidence = _compact_evidence(
+        {
+            "provider": "reality_defender",
+            "request_id": result.get("request_id"),
+            "media_id": result.get("media_id"),
+            "status": status or None,
+            "score": score,
+            "model_votes": reality_defender_vote_summary(result),
+            "reasons": _reality_defender_reasons(result) or None,
+        }
+    )
+
+    if status in {"FAKE", "MANIPULATED"}:
+        return [
+            SignalFinding(
+                "deepfake",
+                "strong",
+                "Reality Defender ensemble marked the audio as fake",
+                evidence=evidence,
+            )
+        ]
+
+    if status == "SUSPICIOUS":
+        return [
+            SignalFinding(
+                "deepfake",
+                "warning",
+                "Reality Defender ensemble marked the audio as suspicious",
+                evidence=evidence,
+            )
+        ]
+
+    if status in {"NOT_APPLICABLE", "UNABLE_TO_EVALUATE"}:
+        return [
+            SignalFinding(
+                "deepfake",
+                "info",
+                f"Reality Defender returned {status}",
+                evidence=evidence,
+            )
+        ]
+
+    return []
+
+
+async def _run_reality_defender_detection_async(
+    path: Path,
+    api_key: str,
+    max_attempts: int = 30,
+    polling_interval_ms: int = DEFAULT_REALITY_DEFENDER_POLL_INTERVAL_MS,
+) -> dict[str, Any]:
+    from realitydefender import RealityDefender
+
+    client = RealityDefender(api_key=api_key)
+    try:
+        client_impl = getattr(client, "client")
+        upload = await client_impl.post(
+            "/api/files/aws-presigned",
+            data={"fileName": path.name},
+        )
+        request_id = upload["requestId"]
+        signed_url = upload["response"]["signedUrl"]
+        session = await client_impl.ensure_session()
+        async with session.put(
+            signed_url,
+            data=path.read_bytes(),
+            headers={"Content-Type": reality_defender_content_type(path)},
+        ) as response:
+            if response.status >= 400:
+                body = await response.text()
+                raise RuntimeError(
+                    f"Reality Defender upload failed with HTTP {response.status}: {body}"
+                )
+
+        result = await poll_reality_defender_media_detail(
+            client_impl,
+            request_id,
+            max_attempts=max_attempts,
+            polling_interval_ms=polling_interval_ms,
+        )
+        if "request_id" not in result and "requestId" not in result:
+            result = {**result, "request_id": request_id}
+        normalized = normalize_reality_defender_result(result)
+        normalized["upload"] = {
+            "filename": path.name,
+            "content_type": reality_defender_content_type(path),
+        }
+        return normalized
+    finally:
+        cleanup = getattr(client, "cleanup", None)
+        if cleanup:
+            await cleanup()
+
+
+def run_reality_defender_detection(
+    path: Path,
+    api_key: str,
+    *,
+    max_attempts: int = 30,
+    polling_interval_ms: int = DEFAULT_REALITY_DEFENDER_POLL_INTERVAL_MS,
+) -> dict[str, Any]:
+    return asyncio.run(
+        _run_reality_defender_detection_async(
+            path,
+            api_key,
+            max_attempts=max_attempts,
+            polling_interval_ms=polling_interval_ms,
+        )
+    )
+
+
+def converted_wav_path(converted_wav: dict[str, Any] | None) -> Path | None:
+    if converted_wav and converted_wav.get("status") == "converted":
+        return Path(str(converted_wav["path"]))
+    return None
+
+
+def select_modulate_stt_input(
+    input_file: Path,
+    converted_wav: dict[str, Any] | None,
+) -> Path:
+    converted = converted_wav_path(converted_wav)
+    if input_file.suffix.lower() in MODULATE_STT_CONVERTED_FALLBACK_SUFFIXES and converted:
+        return converted
+    return input_file
+
+
+def select_reality_defender_input(
+    input_file: Path,
+    converted_wav: dict[str, Any] | None,
+) -> Path:
+    return input_file
+
+
+def reality_defender_error_allows_converted_fallback(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(
+        text in message
+        for text in (
+            "unsupported file type",
+            "unsupported format",
+            "invalid file",
+            "invalid request",
+            "file type",
+            "format",
+        )
+    )
+
+
 def build_report(
     input_file: Path,
     include_deepfake: bool,
     include_stt_enrichment: bool = False,
+    include_reality_defender: bool = False,
     api_key: str | None = None,
+    reality_defender_api_key: str | None = None,
     confidence_threshold: float = 0.8,
     sample_rate: int = DEFAULT_SAMPLE_RATE,
     window_ms: int = DEFAULT_WINDOW_MS,
     converted_wav: dict[str, Any] | None = None,
+    reality_defender_poll_attempts: int = 30,
+    reality_defender_poll_interval_ms: int = DEFAULT_REALITY_DEFENDER_POLL_INTERVAL_MS,
 ) -> dict[str, Any]:
     input_file = input_file.resolve()
     findings: list[SignalFinding] = []
@@ -563,6 +865,8 @@ def build_report(
     deepfake_result = None
     stt_enrichment_result = None
     stt_enrichment_error = None
+    reality_defender_result = None
+    reality_defender_error = None
     if include_deepfake:
         if not api_key:
             findings.append(
@@ -600,9 +904,7 @@ def build_report(
             )
         else:
             try:
-                stt_input = input_file
-                if converted_wav and converted_wav.get("status") == "converted":
-                    stt_input = Path(str(converted_wav["path"]))
+                stt_input = select_modulate_stt_input(input_file, converted_wav)
                 stt_enrichment_result = run_modulate_stt_enrichment(stt_input, api_key)
                 findings.extend(
                     stt_enrichment_findings(
@@ -629,6 +931,85 @@ def build_report(
                     )
                 )
 
+    if include_reality_defender:
+        reality_defender_input = select_reality_defender_input(
+            input_file,
+            converted_wav,
+        )
+        if not reality_defender_api_key:
+            findings.append(
+                SignalFinding(
+                    "deepfake",
+                    "info",
+                    "Reality Defender analysis requested but no API key was provided",
+                    evidence={"provider": "reality_defender"},
+                )
+            )
+        elif reality_defender_input.stat().st_size > REALITY_DEFENDER_AUDIO_SIZE_LIMIT_BYTES:
+            findings.append(
+                SignalFinding(
+                    "deepfake",
+                    "info",
+                    "Reality Defender analysis skipped because the audio file exceeds 20 MB",
+                    evidence={
+                        "provider": "reality_defender",
+                        "path": str(reality_defender_input),
+                        "size_bytes": reality_defender_input.stat().st_size,
+                        "limit_bytes": REALITY_DEFENDER_AUDIO_SIZE_LIMIT_BYTES,
+                    },
+                )
+            )
+        else:
+            try:
+                try:
+                    reality_defender_result = run_reality_defender_detection(
+                        reality_defender_input,
+                        reality_defender_api_key,
+                        max_attempts=reality_defender_poll_attempts,
+                        polling_interval_ms=reality_defender_poll_interval_ms,
+                    )
+                    reality_defender_result["input"] = {
+                        "path": str(reality_defender_input),
+                        "source": "original",
+                    }
+                except Exception as exc:
+                    converted = converted_wav_path(converted_wav)
+                    if (
+                        converted
+                        and converted != reality_defender_input
+                        and reality_defender_error_allows_converted_fallback(exc)
+                    ):
+                        reality_defender_result = run_reality_defender_detection(
+                            converted,
+                            reality_defender_api_key,
+                            max_attempts=reality_defender_poll_attempts,
+                            polling_interval_ms=reality_defender_poll_interval_ms,
+                        )
+                        reality_defender_result["input"] = {
+                            "path": str(converted),
+                            "source": "converted_wav",
+                            "fallback_reason": str(exc),
+                        }
+                    else:
+                        raise
+                findings.extend(reality_defender_findings(reality_defender_result))
+            except Exception as exc:
+                reality_defender_error = {
+                    "service": "reality-defender",
+                    "message": str(exc),
+                }
+                findings.append(
+                    SignalFinding(
+                        "deepfake",
+                        "info",
+                        f"Reality Defender analysis failed: {exc}",
+                        evidence={
+                            "provider": "reality_defender",
+                            "error": str(exc),
+                        },
+                    )
+                )
+
     report = {
         "input": {
             "path": str(input_file),
@@ -642,6 +1023,8 @@ def build_report(
         "deepfake_analysis": deepfake_result,
         "stt_enrichment": stt_enrichment_result,
         "stt_enrichment_error": stt_enrichment_error,
+        "reality_defender_analysis": reality_defender_result,
+        "reality_defender_error": reality_defender_error,
         "findings": [asdict(finding) for finding in findings],
         "overall_conclusion": classify_overall(findings),
         "limitations": [
@@ -736,6 +1119,44 @@ def print_modulate_deepfake_table(
     output.flush()
 
 
+def print_reality_defender_table(
+    report: dict[str, Any],
+    output=sys.stdout,
+) -> None:
+    analysis = report.get("reality_defender_analysis")
+    if not analysis:
+        return
+
+    print("Reality Defender:", file=output)
+    print(f"File:     {report.get('input', {}).get('filename', '?')}", file=output)
+    print(f"Status:   {analysis.get('status') or '?'}", file=output)
+    print(f"Score:    {_score_text(analysis.get('score'))}", file=output)
+    if analysis.get("request_id"):
+        print(f"Request:  {analysis['request_id']}", file=output)
+    print(f"Models:   {reality_defender_vote_summary(analysis)}", file=output)
+    polling = analysis.get("polling") or {}
+    if polling:
+        status = "complete" if polling.get("complete") else "partial"
+        pending = polling.get("pending_audio_models") or []
+        pending_text = ", ".join(pending) if pending else "none"
+        print(
+            f"Polling:  {status} "
+            f"({polling.get('attempts')} attempts, pending={pending_text})",
+            file=output,
+        )
+    print("", file=output)
+
+    for model in _reality_defender_models(analysis):
+        print(
+            f"  {str(model.get('name') or '?'):<18} "
+            f"{str(model.get('status') or '?'):<12} "
+            f"score={_score_text(reality_defender_model_score(model))}",
+            file=output,
+        )
+    print("", file=output)
+    output.flush()
+
+
 def print_modulate_outputs(report: dict[str, Any], output=sys.stdout) -> None:
     deepfake_analysis = report.get("deepfake_analysis")
     stt_enrichment = report.get("stt_enrichment")
@@ -754,6 +1175,29 @@ def print_modulate_outputs(report: dict[str, Any], output=sys.stdout) -> None:
     if stt_enrichment_error:
         print("Raw Modulate STT enrichment error:", file=output)
         print(json_text(stt_enrichment_error, indent=2, sort_keys=True), file=output)
+        print("", file=output)
+
+    output.flush()
+
+
+def print_reality_defender_outputs(
+    report: dict[str, Any],
+    output=sys.stdout,
+) -> None:
+    reality_defender_analysis = report.get("reality_defender_analysis")
+    reality_defender_error = report.get("reality_defender_error")
+
+    if reality_defender_analysis:
+        print("Raw Reality Defender response:", file=output)
+        print(
+            json_text(reality_defender_analysis, indent=2, sort_keys=True),
+            file=output,
+        )
+        print("", file=output)
+
+    if reality_defender_error:
+        print("Raw Reality Defender error:", file=output)
+        print(json_text(reality_defender_error, indent=2, sort_keys=True), file=output)
         print("", file=output)
 
     output.flush()
@@ -889,6 +1333,78 @@ def render_markdown(report: dict[str, Any]) -> str:
             ]
         )
 
+    if report.get("reality_defender_analysis"):
+        analysis = report["reality_defender_analysis"]
+        table_lines = [
+            "| Model | Status | Score |",
+            "| --- | --- | ---: |",
+        ]
+        for model in _reality_defender_models(analysis):
+            table_lines.append(
+                "| "
+                f"{model.get('name') or '?'} | "
+                f"{model.get('status') or '?'} | "
+                f"{_score_text(reality_defender_model_score(model))} |"
+            )
+        lines.extend(
+            [
+                "",
+                "## Reality Defender Analysis",
+                "",
+                f"- Status: `{analysis.get('status') or '?'}`",
+                f"- Score: `{_score_text(analysis.get('score'))}`",
+                f"- Request ID: `{analysis.get('request_id') or '?'}`",
+                f"- Model votes: `{reality_defender_vote_summary(analysis).replace(', ', '`, `')}`",
+            ]
+        )
+        polling = analysis.get("polling") or {}
+        if polling:
+            status = "complete" if polling.get("complete") else "partial"
+            pending = polling.get("pending_audio_models") or []
+            pending_text = ", ".join(pending) if pending else "none"
+            lines.append(
+                f"- Polling: `{status}` "
+                f"(`{polling.get('attempts')}` attempts, pending: `{pending_text}`)"
+            )
+        lines.extend(
+            [
+                "",
+                *table_lines,
+                "",
+                (
+                    "Reality Defender does not provide a time-localized audio cause "
+                    "in this API response. The clearest available explanation is the "
+                    "ensemble score and agreement among the returned audio models."
+                ),
+                "",
+                "### Raw Reality Defender Response",
+                "",
+                "```json",
+                json_text(
+                    analysis,
+                    indent=2,
+                    sort_keys=True,
+                ),
+                "```",
+            ]
+        )
+
+    if report.get("reality_defender_error"):
+        lines.extend(
+            [
+                "",
+                "## Reality Defender Error",
+                "",
+                "```json",
+                json_text(
+                    report["reality_defender_error"],
+                    indent=2,
+                    sort_keys=True,
+                ),
+                "```",
+            ]
+        )
+
     lines.extend(["", "## Limitations", ""])
     lines.extend(f"- {limitation}" for limitation in report["limitations"])
     lines.append("")
@@ -929,15 +1445,66 @@ def write_report(
             json_text(report["stt_enrichment_error"], indent=2, sort_keys=True),
             encoding="utf-8",
         )
+    if report.get("reality_defender_analysis"):
+        (output_dir / "reality_defender_detection.json").write_text(
+            json_text(
+                report["reality_defender_analysis"],
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+    if report.get("reality_defender_error"):
+        (output_dir / "reality_defender_error.json").write_text(
+            json_text(report["reality_defender_error"], indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+
+def _normalize_token_name(value: str) -> str:
+    return value.replace("-", "").replace("_", "").lower()
+
+
+def _read_named_token(api_key_file: Path | None, token_name: str) -> str | None:
+    if not api_key_file or not api_key_file.exists():
+        return None
+
+    text = api_key_file.read_text(encoding="utf-8").strip()
+    if not text:
+        return None
+
+    requested = _normalize_token_name(token_name)
+    legacy_lines: list[str] = []
+    named_tokens: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" in line:
+            key, value = line.split(":", 1)
+            named_tokens[_normalize_token_name(key.strip())] = value.strip()
+        else:
+            legacy_lines.append(line)
+
+    if requested in named_tokens:
+        return named_tokens[requested]
+    if requested == "modulate" and legacy_lines and not named_tokens:
+        return legacy_lines[0].strip()
+    return None
 
 
 def resolve_api_key(api_key_file: Path | None) -> str | None:
     api_key = os.environ.get("MODULATE_API_KEY")
     if api_key:
         return api_key.strip()
-    if api_key_file and api_key_file.exists():
-        return api_key_file.read_text(encoding="utf-8").strip()
-    return None
+    return _read_named_token(api_key_file, "modulate")
+
+
+def resolve_reality_defender_api_key(api_key_file: Path | None) -> str | None:
+    api_key = os.environ.get("REALITY_DEFENDER_API_KEY")
+    if api_key:
+        return api_key.strip()
+    return _read_named_token(api_key_file, "realitydefender")
 
 
 def existing_file(value: str) -> Path:
@@ -947,16 +1514,48 @@ def existing_file(value: str) -> Path:
     return path
 
 
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def reality_defender_poll_attempts_from_wait_seconds(
+    wait_seconds: int,
+    polling_interval_ms: int = DEFAULT_REALITY_DEFENDER_POLL_INTERVAL_MS,
+) -> int:
+    return max(1, math.ceil((wait_seconds * 1000) / polling_interval_ms))
+
+
+def resolve_output_dir(
+    base_output_dir: Path,
+    input_file: Path,
+    input_count: int,
+    all_local_audio: bool,
+) -> Path:
+    if base_output_dir == Path("reports"):
+        output_root = base_output_dir
+        report_stem = "report"
+    else:
+        output_root = base_output_dir.parent
+        report_stem = base_output_dir.name
+    return output_root / input_file.stem / report_stem
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Generate a forensic-style audio authenticity report.",
         epilog=(
             "Examples:\n"
-            "  python3 audio_authenticity_report.py test-voice.mp3 --out reports/test-voice\n"
+            "  python3 audio_authenticity_report.py test-voice.mp3 --out reports/local\n"
             "  python3 audio_authenticity_report.py test-voice.mp3 pocasi_dialog.wav --out reports/batch\n"
             "  python3 audio_authenticity_report.py --all-local-audio --out reports/all-local\n"
             "  python3 audio_authenticity_report.py --all-local-audio --modulate --out reports/full-modulate\n"
-            "  python3 audio_authenticity_report.py test-voice.mp3 --modulate --api-key-file token --out reports/test-voice-full"
+            "  python3 audio_authenticity_report.py test-voice.mp3 --all-checks --out reports/full"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -965,7 +1564,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--out",
         type=Path,
         default=None,
-        help="Output directory. Default: reports/<input-stem>",
+        help=(
+            "Report output path/stem. Files are written to "
+            "<out-parent>/<input-stem>/<out-name>. Default: reports/<input-stem>/report"
+        ),
     )
     parser.add_argument(
         "--deepfake",
@@ -983,6 +1585,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run all Modulate-backed analyses: deepfake batch and STT enrichment.",
     )
     parser.add_argument(
+        "--reality-defender",
+        action="store_true",
+        help="Include Reality Defender ensemble deepfake detection.",
+    )
+    parser.add_argument(
+        "--all-checks",
+        action="store_true",
+        help="Run all external checks: Modulate deepfake, Modulate STT enrichment, and Reality Defender.",
+    )
+    parser.add_argument(
         "--all-local-audio",
         action="store_true",
         help="Analyze all supported audio files in the current directory.",
@@ -992,7 +1604,26 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print raw Modulate JSON responses/errors to the terminal.",
     )
+    parser.add_argument(
+        "--show-raw-reality-defender",
+        action="store_true",
+        help="Print raw Reality Defender JSON responses/errors to the terminal.",
+    )
     parser.add_argument("--api-key-file", type=Path, default=Path("token"))
+    parser.add_argument(
+        "--reality-defender-api-key-file",
+        type=Path,
+        default=Path("token"),
+    )
+    parser.add_argument(
+        "--reality-defender-wait-seconds",
+        type=positive_int,
+        default=DEFAULT_REALITY_DEFENDER_WAIT_SECONDS,
+        help=(
+            "Maximum time to poll Reality Defender for pending audio models. "
+            f"Default: {DEFAULT_REALITY_DEFENDER_WAIT_SECONDS}"
+        ),
+    )
     parser.add_argument("--threshold", type=float, default=0.8)
     parser.add_argument("--sample-rate", type=int, default=DEFAULT_SAMPLE_RATE)
     parser.add_argument("--window-ms", type=int, default=DEFAULT_WINDOW_MS)
@@ -1015,9 +1646,16 @@ def main(argv: list[str] | None = None) -> int:
     if not input_files:
         parser.error("provide at least one input_file or use --all-local-audio")
 
-    include_deepfake = args.deepfake or args.modulate
-    include_stt_enrichment = args.stt_enrichment or args.modulate
+    include_deepfake = args.deepfake or args.modulate or args.all_checks
+    include_stt_enrichment = args.stt_enrichment or args.modulate or args.all_checks
+    include_reality_defender = args.reality_defender or args.all_checks
+    reality_defender_poll_attempts = reality_defender_poll_attempts_from_wait_seconds(
+        args.reality_defender_wait_seconds,
+    )
     api_key = resolve_api_key(args.api_key_file)
+    reality_defender_api_key = resolve_reality_defender_api_key(
+        args.reality_defender_api_key_file
+    )
     base_output_dir = args.out or Path("reports")
 
     for input_file in input_files:
@@ -1031,11 +1669,18 @@ def main(argv: list[str] | None = None) -> int:
             print_progress("    modulate: STT enrichment enabled")
         elif include_stt_enrichment:
             print_progress("    modulate: STT enrichment requested without API key")
+        if include_reality_defender and reality_defender_api_key:
+            print_progress("    reality defender: ensemble detection enabled")
+        elif include_reality_defender:
+            print_progress(
+                "    reality defender: ensemble detection requested without API key"
+            )
 
-        output_dir = (
-            base_output_dir / input_file.stem
-            if len(input_files) > 1 or args.all_local_audio
-            else base_output_dir
+        output_dir = resolve_output_dir(
+            base_output_dir=base_output_dir,
+            input_file=input_file,
+            input_count=len(input_files),
+            all_local_audio=args.all_local_audio,
         )
         print_progress(f"    local: converting to {output_dir / 'source.wav'}")
         converted_wav = convert_to_wav(
@@ -1044,26 +1689,40 @@ def main(argv: list[str] | None = None) -> int:
             sample_rate=args.sample_rate,
         )
         if converted_wav.get("status") == "converted":
-            print_progress("    stt-enrichment input: converted WAV")
+            stt_preview_input = select_modulate_stt_input(input_file, converted_wav)
+            stt_source = (
+                "converted WAV"
+                if stt_preview_input != input_file
+                else "original file"
+            )
+            print_progress(f"    stt-enrichment input: {stt_source}")
         elif include_stt_enrichment:
             print_progress(
                 "    stt-enrichment input: original file "
                 f"(WAV conversion {converted_wav.get('status')})"
             )
+        if include_reality_defender:
+            print_progress("    reality defender input: original file")
         report = build_report(
             input_file,
             include_deepfake=include_deepfake,
             include_stt_enrichment=include_stt_enrichment,
+            include_reality_defender=include_reality_defender,
             api_key=api_key,
+            reality_defender_api_key=reality_defender_api_key,
             confidence_threshold=args.threshold,
             sample_rate=args.sample_rate,
             window_ms=args.window_ms,
             converted_wav=converted_wav,
+            reality_defender_poll_attempts=reality_defender_poll_attempts,
         )
         print_progress_summary(report)
         print_modulate_deepfake_table(report)
+        print_reality_defender_table(report)
         if args.show_raw_modulate:
             print_modulate_outputs(report)
+        if args.show_raw_reality_defender:
+            print_reality_defender_outputs(report)
         write_report(report, output_dir)
         print(f"Wrote {output_dir / 'report.md'}")
         print(f"Wrote {output_dir / 'report.json'}")
@@ -1073,6 +1732,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Wrote {output_dir / 'modulate_stt_enrichment.json'}")
         if report.get("stt_enrichment_error"):
             print(f"Wrote {output_dir / 'modulate_stt_enrichment_error.json'}")
+        if report.get("reality_defender_analysis"):
+            print(f"Wrote {output_dir / 'reality_defender_detection.json'}")
+        if report.get("reality_defender_error"):
+            print(f"Wrote {output_dir / 'reality_defender_error.json'}")
         if report.get("converted_wav"):
             converted = report["converted_wav"]
             if converted.get("status") == "converted":
